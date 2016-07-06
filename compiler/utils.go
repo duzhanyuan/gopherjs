@@ -5,15 +5,16 @@ import (
 	"encoding/binary"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
+	"go/types"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/gopherjs/gopherjs/compiler/analysis"
 	"github.com/gopherjs/gopherjs/compiler/typesutil"
-
-	"golang.org/x/tools/go/types"
 )
 
 func (c *funcContext) Write(b []byte) (int, error) {
@@ -75,7 +76,7 @@ func (c *funcContext) Delayed(f func()) {
 
 func (c *funcContext) translateArgs(sig *types.Signature, argExprs []ast.Expr, ellipsis, clone bool) []string {
 	if len(argExprs) == 1 {
-		if tuple, isTuple := c.p.Types[argExprs[0]].Type.(*types.Tuple); isTuple {
+		if tuple, isTuple := c.p.TypeOf(argExprs[0]).(*types.Tuple); isTuple {
 			tupleVar := c.newVariable("_tuple")
 			c.Printf("%s = %s;", tupleVar, c.translateExpr(argExprs[0]))
 			argExprs = make([]ast.Expr, tuple.Len())
@@ -130,7 +131,7 @@ func (c *funcContext) translateArgs(sig *types.Signature, argExprs []ast.Expr, e
 	return args
 }
 
-func (c *funcContext) translateSelection(sel *types.Selection, pos token.Pos) ([]string, string) {
+func (c *funcContext) translateSelection(sel selection, pos token.Pos) ([]string, string) {
 	var fields []string
 	t := sel.Recv()
 	for _, index := range sel.Index() {
@@ -164,40 +165,41 @@ func (c *funcContext) translateSelection(sel *types.Selection, pos token.Pos) ([
 	return fields, ""
 }
 
-func (c *funcContext) zeroValue(ty types.Type) string {
-	if typesutil.IsJsObject(ty) {
-		return "null"
-	}
+var nilObj = types.Universe.Lookup("nil")
+
+func (c *funcContext) zeroValue(ty types.Type) ast.Expr {
 	switch t := ty.Underlying().(type) {
 	case *types.Basic:
 		switch {
-		case is64Bit(t) || isComplex(t):
-			return fmt.Sprintf("new %s(0, 0)", c.typeName(ty))
 		case isBoolean(t):
-			return "false"
-		case isNumeric(t), t.Kind() == types.UnsafePointer:
-			return "0"
+			return c.newConst(ty, constant.MakeBool(false))
+		case isNumeric(t):
+			return c.newConst(ty, constant.MakeInt64(0))
 		case isString(t):
-			return `""`
+			return c.newConst(ty, constant.MakeString(""))
+		case t.Kind() == types.UnsafePointer:
+			// fall through to "nil"
 		case t.Kind() == types.UntypedNil:
 			panic("Zero value for untyped nil.")
 		default:
-			panic("Unhandled type")
+			panic(fmt.Sprintf("Unhandled basic type: %v\n", t))
 		}
-	case *types.Array:
-		return fmt.Sprintf("%s.zero()", c.typeName(ty))
-	case *types.Signature:
-		return "$throwNilPointerError"
-	case *types.Slice:
-		return fmt.Sprintf("%s.nil", c.typeName(ty))
-	case *types.Struct:
-		return fmt.Sprintf("new %s.ptr()", c.typeName(ty))
-	case *types.Map:
-		return "false"
-	case *types.Interface:
-		return "$ifaceNil"
+	case *types.Array, *types.Struct:
+		return c.setType(&ast.CompositeLit{}, ty)
+	case *types.Chan, *types.Interface, *types.Map, *types.Signature, *types.Slice, *types.Pointer:
+		// fall through to "nil"
+	default:
+		panic(fmt.Sprintf("Unhandled type: %T\n", t))
 	}
-	return fmt.Sprintf("%s.nil", c.typeName(ty))
+	id := c.newIdent("nil", ty)
+	c.p.Uses[id] = nilObj
+	return id
+}
+
+func (c *funcContext) newConst(t types.Type, value constant.Value) ast.Expr {
+	id := &ast.Ident{}
+	c.p.Types[id] = types.TypeAndValue{Type: t, Value: value}
+	return id
 }
 
 func (c *funcContext) newVariable(name string) string {
@@ -208,12 +210,7 @@ func (c *funcContext) newVariableWithLevel(name string, pkgLevel bool) string {
 	if name == "" {
 		panic("newVariable: empty name")
 	}
-	for _, b := range []byte(name) {
-		if b < '0' || b > 'z' {
-			name = "nonAsciiName"
-			break
-		}
-	}
+	name = encodeIdent(name)
 	if c.p.minify {
 		i := 0
 		for {
@@ -268,29 +265,42 @@ func (c *funcContext) setType(e ast.Expr, t types.Type) ast.Expr {
 	return e
 }
 
-func (c *funcContext) objectName(o types.Object) string {
-	if o.Pkg() != c.p.Pkg || o.Parent() == c.p.Pkg.Scope() {
-		c.p.dependencies[o] = true
+func (c *funcContext) pkgVar(pkg *types.Package) string {
+	if pkg == c.p.Pkg {
+		return "$pkg"
 	}
 
-	if o.Pkg() != c.p.Pkg {
-		pkgVar, found := c.p.pkgVars[o.Pkg().Path()]
-		if !found {
-			pkgVar = fmt.Sprintf(`$packages["%s"]`, o.Pkg().Path())
-		}
-		return pkgVar + "." + o.Name()
+	pkgVar, found := c.p.pkgVars[pkg.Path()]
+	if !found {
+		pkgVar = fmt.Sprintf(`$packages["%s"]`, pkg.Path())
 	}
+	return pkgVar
+}
 
+func isVarOrConst(o types.Object) bool {
 	switch o.(type) {
 	case *types.Var, *types.Const:
-		if o.Exported() && o.Parent() == c.p.Pkg.Scope() {
-			return "$pkg." + o.Name()
+		return true
+	}
+	return false
+}
+
+func isPkgLevel(o types.Object) bool {
+	return o.Parent() != nil && o.Parent().Parent() == types.Universe
+}
+
+func (c *funcContext) objectName(o types.Object) string {
+	if isPkgLevel(o) {
+		c.p.dependencies[o] = true
+
+		if o.Pkg() != c.p.Pkg || (isVarOrConst(o) && o.Exported()) {
+			return c.pkgVar(o.Pkg()) + "." + o.Name()
 		}
 	}
 
 	name, ok := c.p.objectNames[o]
 	if !ok {
-		name = c.newVariableWithLevel(o.Name(), o.Parent() == c.p.Pkg.Scope())
+		name = c.newVariableWithLevel(o.Name(), isPkgLevel(o))
 		c.p.objectNames[o] = name
 	}
 
@@ -300,11 +310,15 @@ func (c *funcContext) objectName(o types.Object) string {
 	return name
 }
 
-func (c *funcContext) varPtrName(v *types.Var) string {
-	name, ok := c.p.varPtrNames[v]
+func (c *funcContext) varPtrName(o *types.Var) string {
+	if isPkgLevel(o) && o.Exported() {
+		return c.pkgVar(o.Pkg()) + "." + o.Name() + "$ptr"
+	}
+
+	name, ok := c.p.varPtrNames[o]
 	if !ok {
-		name = c.newVariableWithLevel(v.Name()+"_ptr", v.Parent() == c.p.Pkg.Scope())
-		c.p.varPtrNames[v] = name
+		name = c.newVariableWithLevel(o.Name()+"$ptr", isPkgLevel(o))
+		c.p.varPtrNames[o] = name
 	}
 	return name
 }
@@ -334,25 +348,6 @@ func (c *funcContext) typeName(ty types.Type) string {
 	}
 	c.p.dependencies[anonType] = true
 	return anonType.Name()
-}
-
-func (c *funcContext) makeKey(expr ast.Expr, keyType types.Type) string {
-	switch t := keyType.Underlying().(type) {
-	case *types.Array, *types.Struct:
-		return fmt.Sprintf("(new %s(%s)).$key()", c.typeName(keyType), c.translateExpr(expr))
-	case *types.Basic:
-		if is64Bit(t) || isComplex(t) {
-			return fmt.Sprintf("%s.$key()", c.translateExpr(expr))
-		}
-		if isFloat(t) {
-			return fmt.Sprintf("$floatKey(%s)", c.translateExpr(expr))
-		}
-		return c.translateImplicitConversion(expr, keyType).String()
-	case *types.Chan, *types.Pointer, *types.Interface:
-		return fmt.Sprintf("%s.$key()", c.translateImplicitConversion(expr, keyType))
-	default:
-		return c.translateImplicitConversion(expr, keyType).String()
-	}
 }
 
 func (c *funcContext) externalize(s string, t types.Type) string {
@@ -484,7 +479,7 @@ func isWrapped(ty types.Type) bool {
 	switch t := ty.Underlying().(type) {
 	case *types.Basic:
 		return !is64Bit(t) && !isComplex(t) && t.Kind() != types.UntypedNil
-	case *types.Array, *types.Map, *types.Signature:
+	case *types.Array, *types.Chan, *types.Map, *types.Signature:
 		return true
 	case *types.Pointer:
 		_, isArray := t.Elem().Underlying().(*types.Array)
@@ -633,4 +628,17 @@ func rangeCheck(pattern string, constantIndex, array bool) string {
 		check = "(%2f < 0 || " + check + ")"
 	}
 	return "(" + check + ` ? $throwRuntimeError("index out of range") : ` + pattern + ")"
+}
+
+func endsWithReturn(stmts []ast.Stmt) bool {
+	if len(stmts) > 0 {
+		if _, ok := stmts[len(stmts)-1].(*ast.ReturnStmt); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func encodeIdent(name string) string {
+	return strings.Replace(url.QueryEscape(name), "%", "$", -1)
 }

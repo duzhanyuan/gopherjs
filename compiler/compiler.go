@@ -7,17 +7,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/token"
+	"go/types"
 	"io"
 	"strings"
 
 	"github.com/gopherjs/gopherjs/compiler/prelude"
-	"golang.org/x/tools/go/gcimporter"
-	"golang.org/x/tools/go/types"
+	"github.com/gopherjs/gopherjs/third_party/importer"
 )
 
 var sizes32 = &types.StdSizes{WordSize: 4, MaxAlign: 8}
 var reservedKeywords = make(map[string]bool)
-var _ = ___GOPHERJS_REQUIRES_GO_VERSION_1_4___ // compile error on earlier Go versions
+var _ = ___GOPHERJS_REQUIRES_GO_VERSION_1_6___ // compile error on earlier Go versions
 
 func init() {
 	for _, keyword := range []string{"abstract", "arguments", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "debugger", "default", "delete", "do", "double", "else", "enum", "eval", "export", "extends", "false", "final", "finally", "float", "for", "function", "goto", "if", "implements", "import", "in", "instanceof", "int", "interface", "let", "long", "native", "new", "null", "package", "private", "protected", "public", "return", "short", "static", "super", "switch", "synchronized", "this", "throw", "throws", "transient", "true", "try", "typeof", "undefined", "var", "void", "volatile", "while", "with", "yield"} {
@@ -35,12 +35,11 @@ type Archive struct {
 	ImportPath   string
 	Name         string
 	Imports      []string
-	GcData       []byte
+	ExportData   []byte
 	Declarations []*Decl
+	IncJSCode    []byte
 	FileSet      []byte
 	Minified     bool
-
-	types *types.Package
 }
 
 type Decl struct {
@@ -97,11 +96,17 @@ func ImportDependencies(archive *Archive, importPkg func(string) (*Archive, erro
 	return deps, nil
 }
 
+type dceInfo struct {
+	decl         *Decl
+	objectFilter string
+	methodFilter string
+}
+
 func WriteProgramCode(pkgs []*Archive, w *SourceMapFilter) error {
 	mainPkg := pkgs[len(pkgs)-1]
 	minify := mainPkg.Minified
 
-	declsByObject := make(map[string][]*Decl)
+	byFilter := make(map[string][]*dceInfo)
 	var pendingDecls []*Decl
 	for _, pkg := range pkgs {
 		for _, d := range pkg.Declarations {
@@ -109,32 +114,37 @@ func WriteProgramCode(pkgs []*Archive, w *SourceMapFilter) error {
 				pendingDecls = append(pendingDecls, d)
 				continue
 			}
+			info := &dceInfo{decl: d}
 			if d.DceObjectFilter != "" {
-				d.DceObjectFilter = pkg.ImportPath + "." + d.DceObjectFilter
-				declsByObject[d.DceObjectFilter] = append(declsByObject[d.DceObjectFilter], d)
+				info.objectFilter = pkg.ImportPath + "." + d.DceObjectFilter
+				byFilter[info.objectFilter] = append(byFilter[info.objectFilter], info)
 			}
 			if d.DceMethodFilter != "" {
-				d.DceMethodFilter = pkg.ImportPath + "." + d.DceMethodFilter
-				declsByObject[d.DceMethodFilter] = append(declsByObject[d.DceMethodFilter], d)
+				info.methodFilter = pkg.ImportPath + "." + d.DceMethodFilter
+				byFilter[info.methodFilter] = append(byFilter[info.methodFilter], info)
 			}
 		}
 	}
 
+	dceSelection := make(map[*Decl]struct{})
 	for len(pendingDecls) != 0 {
 		d := pendingDecls[len(pendingDecls)-1]
 		pendingDecls = pendingDecls[:len(pendingDecls)-1]
+
+		dceSelection[d] = struct{}{}
+
 		for _, dep := range d.DceDeps {
-			if decls, ok := declsByObject[dep]; ok {
-				delete(declsByObject, dep)
-				for _, d := range decls {
-					if d.DceObjectFilter == dep {
-						d.DceObjectFilter = ""
+			if infos, ok := byFilter[dep]; ok {
+				delete(byFilter, dep)
+				for _, info := range infos {
+					if info.objectFilter == dep {
+						info.objectFilter = ""
 					}
-					if d.DceMethodFilter == dep {
-						d.DceMethodFilter = ""
+					if info.methodFilter == dep {
+						info.methodFilter = ""
 					}
-					if d.DceObjectFilter == "" && d.DceMethodFilter == "" {
-						pendingDecls = append(pendingDecls, d)
+					if info.objectFilter == "" && info.methodFilter == "" {
+						pendingDecls = append(pendingDecls, info.decl)
 					}
 				}
 			}
@@ -153,24 +163,27 @@ func WriteProgramCode(pkgs []*Archive, w *SourceMapFilter) error {
 
 	// write packages
 	for _, pkg := range pkgs {
-		if err := WritePkgCode(pkg, minify, w); err != nil {
+		if err := WritePkgCode(pkg, dceSelection, minify, w); err != nil {
 			return err
 		}
 	}
 
-	if _, err := w.Write([]byte("$synthesizeMethods();\n$packages[\"runtime\"].$init();\n$go($packages[\"" + string(mainPkg.ImportPath) + "\"].$init, [], true);\n$flushConsole();\n\n}).call(this);\n")); err != nil {
+	if _, err := w.Write([]byte("$synthesizeMethods();\nvar $mainPkg = $packages[\"" + string(mainPkg.ImportPath) + "\"];\n$packages[\"runtime\"].$init();\n$go($mainPkg.$init, [], true);\n$flushConsole();\n\n}).call(this);\n")); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func WritePkgCode(pkg *Archive, minify bool, w *SourceMapFilter) error {
+func WritePkgCode(pkg *Archive, dceSelection map[*Decl]struct{}, minify bool, w *SourceMapFilter) error {
 	if w.MappingCallback != nil && pkg.FileSet != nil {
 		w.fileSet = token.NewFileSet()
 		if err := w.fileSet.Read(json.NewDecoder(bytes.NewReader(pkg.FileSet)).Decode); err != nil {
 			panic(err)
 		}
+	}
+	if _, err := w.Write(pkg.IncJSCode); err != nil {
+		return err
 	}
 	if _, err := w.Write(removeWhitespace([]byte(fmt.Sprintf("$packages[\"%s\"] = (function() {\n", pkg.ImportPath)), minify)); err != nil {
 		return err
@@ -178,7 +191,7 @@ func WritePkgCode(pkg *Archive, minify bool, w *SourceMapFilter) error {
 	vars := []string{"$pkg = {}", "$init"}
 	var filteredDecls []*Decl
 	for _, d := range pkg.Declarations {
-		if d.DceObjectFilter == "" && d.DceMethodFilter == "" {
+		if _, ok := dceSelection[d]; ok {
 			vars = append(vars, d.Vars...)
 			filteredDecls = append(filteredDecls, d)
 		}
@@ -226,11 +239,10 @@ func ReadArchive(filename, path string, r io.Reader, packages map[string]*types.
 	}
 
 	var err error
-	a.types, err = gcimporter.ImportData(packages, filename, path, bytes.NewReader(a.GcData))
+	_, packages[path], err = importer.ImportData(packages, a.ExportData)
 	if err != nil {
 		return nil, err
 	}
-	packages[path] = a.types
 
 	return &a, nil
 }

@@ -17,12 +17,12 @@
 //  | []float64             | Float64Array          | []float64                       |
 //  | all other slices      | Array                 | []interface{}                   |
 //  | arrays                | see slice type        | see slice type                  |
-//  | functions             | Function              | func(...interface{}) *js.object |
+//  | functions             | Function              | func(...interface{}) *js.Object |
 //  | time.Time             | Date                  | time.Time                       |
-//  | -                     | instanceof Node       | *js.object                      |
+//  | -                     | instanceof Node       | *js.Object                      |
 //  | maps, structs         | instanceof Object     | map[string]interface{}          |
 //
-// Additionally, for a struct containing a *js.object field, only the content of the field will be passed to JavaScript and vice versa.
+// Additionally, for a struct containing a *js.Object field, only the content of the field will be passed to JavaScript and vice versa.
 package js
 
 // Object is a container for a native JavaScript object. Calls to its methods are treated specially by GopherJS and translated directly to their JavaScript syntax. A nil pointer to Object is equal to JavaScript's "null". Object can not be used as a map key.
@@ -79,7 +79,7 @@ func (o *Object) Interface() interface{} { return o.object.Interface() }
 // Unsafe returns the object as an uintptr, which can be converted via unsafe.Pointer. Not intended for public use.
 func (o *Object) Unsafe() uintptr { return o.object.Unsafe() }
 
-// Error encapsulates JavaScript errors. Those are turned into a Go panic and may be rescued, giving an *Error that holds the JavaScript error object.
+// Error encapsulates JavaScript errors. Those are turned into a Go panic and may be recovered, giving an *Error that holds the JavaScript error object.
 type Error struct {
 	*Object
 }
@@ -112,8 +112,8 @@ func InternalObject(i interface{}) *Object {
 }
 
 // MakeFunc wraps a function and gives access to the values of JavaScript's "this" and "arguments" keywords.
-func MakeFunc(func(this *Object, arguments []*Object) interface{}) *Object {
-	return nil
+func MakeFunc(fn func(this *Object, arguments []*Object) interface{}) *Object {
+	return Global.Call("$makeFunc", InternalObject(fn))
 }
 
 // Keys returns the keys of the given JavaScript object.
@@ -133,6 +133,7 @@ func Keys(o *Object) []string {
 func MakeWrapper(i interface{}) *Object {
 	v := InternalObject(i)
 	o := Global.Get("Object").New()
+	o.Set("__internal_object__", v)
 	methods := v.Get("constructor").Get("methods")
 	for i := 0; i < methods.Length(); i++ {
 		m := methods.Index(i)

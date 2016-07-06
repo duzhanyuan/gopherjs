@@ -3,11 +3,10 @@ package analysis
 import (
 	"go/ast"
 	"go/token"
+	"go/types"
 
 	"github.com/gopherjs/gopherjs/compiler/astutil"
 	"github.com/gopherjs/gopherjs/compiler/typesutil"
-
-	"golang.org/x/tools/go/types"
 )
 
 type continueStmt struct {
@@ -208,7 +207,7 @@ func (c *FuncInfo) Visit(node ast.Node) ast.Visitor {
 			c.markBlocking(c.analyzeStack)
 		}
 	case *ast.RangeStmt:
-		if _, ok := c.p.Types[n.X].Type.Underlying().(*types.Chan); ok {
+		if _, ok := c.p.TypeOf(n.X).Underlying().(*types.Chan); ok {
 			c.markBlocking(c.analyzeStack)
 		}
 	case *ast.SelectStmt:
@@ -219,6 +218,15 @@ func (c *FuncInfo) Visit(node ast.Node) ast.Visitor {
 		}
 		c.markBlocking(c.analyzeStack)
 	case *ast.CommClause:
+		switch comm := n.Comm.(type) {
+		case *ast.SendStmt:
+			ast.Walk(c, comm.Chan)
+			ast.Walk(c, comm.Value)
+		case *ast.ExprStmt:
+			ast.Walk(c, comm.X.(*ast.UnaryExpr).X)
+		case *ast.AssignStmt:
+			ast.Walk(c, comm.Rhs[0].(*ast.UnaryExpr).X)
+		}
 		for _, s := range n.Body {
 			ast.Walk(c, s)
 		}

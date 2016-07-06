@@ -2,19 +2,16 @@ package filter
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/token"
-
-	"github.com/gopherjs/gopherjs/compiler/analysis"
-
-	"golang.org/x/tools/go/exact"
-	"golang.org/x/tools/go/types"
+	"go/types"
 )
 
-func IncDecStmt(stmt ast.Stmt, info *analysis.Info) ast.Stmt {
+func IncDecStmt(stmt ast.Stmt, info *types.Info) ast.Stmt {
 	if s, ok := stmt.(*ast.IncDecStmt); ok {
-		t := info.Types[s.X].Type
+		t := info.TypeOf(s.X)
 		if iExpr, isIExpr := s.X.(*ast.IndexExpr); isIExpr {
-			switch u := info.Types[iExpr.X].Type.Underlying().(type) {
+			switch u := info.TypeOf(iExpr.X).Underlying().(type) {
 			case *types.Array:
 				t = u.Elem()
 			case *types.Slice:
@@ -30,7 +27,7 @@ func IncDecStmt(stmt ast.Stmt, info *analysis.Info) ast.Stmt {
 		}
 
 		one := &ast.BasicLit{Kind: token.INT}
-		info.Types[one] = types.TypeAndValue{Type: t, Value: exact.MakeInt64(1)}
+		info.Types[one] = types.TypeAndValue{Type: t, Value: constant.MakeInt64(1)}
 
 		return &ast.AssignStmt{
 			Lhs: []ast.Expr{s.X},

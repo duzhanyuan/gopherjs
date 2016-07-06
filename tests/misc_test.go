@@ -2,9 +2,14 @@ package tests
 
 import (
 	"math"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+	"vendored"
+
+	"github.com/gopherjs/gopherjs/tests/otherpkg"
 )
 
 func TestSyntax1(t *testing.T) {
@@ -62,7 +67,7 @@ func TestStructKey(t *testing.T) {
 	m := make(map[SingleValue]int)
 	m[SingleValue{Value: 1}] = 42
 	m[SingleValue{Value: 2}] = 43
-	if m[SingleValue{Value: 1}] != 42 || m[SingleValue{Value: 2}] != 43 {
+	if m[SingleValue{Value: 1}] != 42 || m[SingleValue{Value: 2}] != 43 || reflect.ValueOf(m).MapIndex(reflect.ValueOf(SingleValue{Value: 1})).Interface() != 42 {
 		t.Fail()
 	}
 
@@ -70,7 +75,7 @@ func TestStructKey(t *testing.T) {
 	m2[SingleValue{Value: 1}] = 42
 	m2[SingleValue{Value: 2}] = 43
 	m2[OtherSingleValue{Value: 1}] = 44
-	if m2[SingleValue{Value: 1}] != 42 || m2[SingleValue{Value: 2}] != 43 || m2[OtherSingleValue{Value: 1}] != 44 {
+	if m2[SingleValue{Value: 1}] != 42 || m2[SingleValue{Value: 2}] != 43 || m2[OtherSingleValue{Value: 1}] != 44 || reflect.ValueOf(m2).MapIndex(reflect.ValueOf(SingleValue{Value: 1})).Interface() != 42 {
 		t.Fail()
 	}
 }
@@ -251,7 +256,7 @@ func TestNilInterfaceError(t *testing.T) {
 		}
 	}()
 	var err error
-	err.Error()
+	_ = err.Error()
 }
 
 func TestIndexOutOfRangeError(t *testing.T) {
@@ -301,4 +306,282 @@ func TestNumGoroutine(t *testing.T) {
 		t.Errorf("runtime.NumGoroutine(): Got %d, want %d.", got, want)
 	}
 	c <- true
+}
+
+func TestMapAssign(t *testing.T) {
+	x := 0
+	m := map[string]string{}
+	x, m["foo"] = 5, "bar"
+	if x != 5 || m["foo"] != "bar" {
+		t.Fail()
+	}
+}
+
+func TestSwitchStatement(t *testing.T) {
+	zero := 0
+	var interfaceZero interface{} = zero
+	switch {
+	case interfaceZero:
+		t.Fail()
+	default:
+		// ok
+	}
+}
+
+func TestAddAssignOnPackageVar(t *testing.T) {
+	otherpkg.Test = 0
+	otherpkg.Test += 42
+	if otherpkg.Test != 42 {
+		t.Fail()
+	}
+}
+
+func TestPointerOfPackageVar(t *testing.T) {
+	otherpkg.Test = 42
+	p := &otherpkg.Test
+	if *p != 42 {
+		t.Fail()
+	}
+}
+
+func TestFuncInSelect(t *testing.T) {
+	f := func(_ func()) chan int {
+		return make(chan int, 1)
+	}
+	select {
+	case <-f(func() {}):
+	case _ = <-f(func() {}):
+	case f(func() {}) <- 42:
+	}
+}
+
+func TestEscapeAnalysisOnForLoopVariableScope(t *testing.T) {
+	for i := 0; ; {
+		p := &i
+		time.Sleep(0)
+		i = 42
+		if *p != 42 {
+			t.Fail()
+		}
+		break
+	}
+}
+
+func TestGoStmtWithStructArg(t *testing.T) {
+	type S struct {
+		i int
+	}
+
+	f := func(s S, c chan int) {
+		c <- s.i
+		c <- s.i
+	}
+
+	c := make(chan int)
+	s := S{42}
+	go f(s, c)
+	s.i = 0
+	if <-c != 42 {
+		t.Fail()
+	}
+	if <-c != 42 {
+		t.Fail()
+	}
+}
+
+type methodExprCallType int
+
+func (i methodExprCallType) test() int {
+	return int(i) + 2
+}
+
+func TestMethodExprCall(t *testing.T) {
+	if methodExprCallType.test(40) != 42 {
+		t.Fail()
+	}
+}
+
+func TestCopyOnSend(t *testing.T) {
+	type S struct{ i int }
+	c := make(chan S, 2)
+	go func() {
+		var s S
+		s.i = 42
+		c <- s
+		select {
+		case c <- s:
+		}
+		s.i = 10
+	}()
+	if (<-c).i != 42 {
+		t.Fail()
+	}
+	if (<-c).i != 42 {
+		t.Fail()
+	}
+}
+
+func TestEmptySelectCase(t *testing.T) {
+	ch := make(chan int, 1)
+	ch <- 42
+
+	var v = 0
+	select {
+	case v = <-ch:
+	}
+	if v != 42 {
+		t.Fail()
+	}
+}
+
+var a int
+var b int
+var C int
+var D int
+
+var a1 = &a
+var a2 = &a
+var b1 = &b
+var C1 = &C
+var C2 = &C
+var D1 = &D
+
+func TestPkgVarPointers(t *testing.T) {
+	if a1 != a2 || a1 == b1 || C1 != C2 || C1 == D1 {
+		t.Fail()
+	}
+}
+
+func TestStringMap(t *testing.T) {
+	m := make(map[string]interface{})
+	if m["__proto__"] != nil {
+		t.Fail()
+	}
+	m["__proto__"] = 42
+	if m["__proto__"] != 42 {
+		t.Fail()
+	}
+}
+
+type Int int
+
+func (i Int) Value() int {
+	return int(i)
+}
+
+func (i *Int) ValueByPtr() int {
+	return int(*i)
+}
+
+func TestWrappedTypeMethod(t *testing.T) {
+	i := Int(42)
+	p := &i
+	if p.Value() != 42 {
+		t.Fail()
+	}
+}
+
+type EmbeddedInt struct {
+	Int
+}
+
+func TestEmbeddedMethod(t *testing.T) {
+	e := EmbeddedInt{42}
+	if e.ValueByPtr() != 42 {
+		t.Fail()
+	}
+}
+
+func TestBoolConvert(t *testing.T) {
+	if !reflect.ValueOf(true).Convert(reflect.TypeOf(true)).Bool() {
+		t.Fail()
+	}
+}
+
+func TestGoexit(t *testing.T) {
+	go func() {
+		runtime.Goexit()
+	}()
+}
+
+func TestVendoring(t *testing.T) {
+	if vendored.Answer != 42 {
+		t.Fail()
+	}
+}
+
+func TestShift(t *testing.T) {
+	if x := uint(32); uint32(1)<<x != 0 {
+		t.Fail()
+	}
+	if x := uint64(0); uint32(1)<<x != 1 {
+		t.Fail()
+	}
+	if x := uint(4294967295); x>>32 != 0 {
+		t.Fail()
+	}
+	if x := uint(4294967295); x>>35 != 0 {
+		t.Fail()
+	}
+}
+
+func TestTrivialSwitch(t *testing.T) {
+	for {
+		switch {
+		default:
+			break
+		}
+		return
+	}
+	t.Fail()
+}
+
+func TestTupleFnReturnImplicitCast(t *testing.T) {
+	var ycalled int = 0
+	x := func(fn func() (int, error)) (interface{}, error) {
+		return fn()
+	}
+	y, _ := x(func() (int, error) {
+		ycalled++
+		return 14, nil
+	})
+	if y != 14 || ycalled != 1 {
+		t.Fail()
+	}
+}
+
+var tuple2called = 0
+
+func tuple1() (interface{}, error) {
+	return tuple2()
+}
+func tuple2() (int, error) {
+	tuple2called++
+	return 14, nil
+}
+func TestTupleReturnImplicitCast(t *testing.T) {
+	x, _ := tuple1()
+	if x != 14 || tuple2called != 1 {
+		t.Fail()
+	}
+}
+
+func TestDeferNamedTupleReturnImplicitCast(t *testing.T) {
+	var ycalled int = 0
+	var zcalled int = 0
+	z := func() {
+		zcalled++
+	}
+	x := func(fn func() (int, error)) (i interface{}, e error) {
+		defer z()
+		i, e = fn()
+		return
+	}
+	y, _ := x(func() (int, error) {
+		ycalled++
+		return 14, nil
+	})
+	if y != 14 || ycalled != 1 || zcalled != 1 {
+		t.Fail()
+	}
 }

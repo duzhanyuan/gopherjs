@@ -5,18 +5,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
+	"go/types"
 	"sort"
 	"strings"
 
 	"github.com/gopherjs/gopherjs/compiler/analysis"
-	"github.com/gopherjs/gopherjs/gcexporter"
-	"golang.org/x/tools/go/types"
+	"github.com/gopherjs/gopherjs/third_party/importer"
+	"github.com/neelance/astrewrite"
 	"golang.org/x/tools/go/types/typeutil"
 )
 
 type pkgContext struct {
 	*analysis.Info
+	additionalSelections map[*ast.SelectorExpr]selection
+
 	typeNames    []*types.TypeName
 	pkgVars      map[string]string
 	objectNames  map[types.Object]string
@@ -30,6 +34,38 @@ type pkgContext struct {
 	fileSet      *token.FileSet
 	errList      ErrorList
 }
+
+func (p *pkgContext) SelectionOf(e *ast.SelectorExpr) (selection, bool) {
+	if sel, ok := p.Selections[e]; ok {
+		return sel, true
+	}
+	if sel, ok := p.additionalSelections[e]; ok {
+		return sel, true
+	}
+	return nil, false
+}
+
+type selection interface {
+	Kind() types.SelectionKind
+	Recv() types.Type
+	Index() []int
+	Obj() types.Object
+	Type() types.Type
+}
+
+type fakeSelection struct {
+	kind  types.SelectionKind
+	recv  types.Type
+	index []int
+	obj   types.Object
+	typ   types.Type
+}
+
+func (sel *fakeSelection) Kind() types.SelectionKind { return sel.kind }
+func (sel *fakeSelection) Recv() types.Type          { return sel.recv }
+func (sel *fakeSelection) Index() []int              { return sel.index }
+func (sel *fakeSelection) Obj() types.Object         { return sel.obj }
+func (sel *fakeSelection) Type() types.Type          { return sel.typ }
 
 type funcContext struct {
 	*analysis.FuncInfo
@@ -59,11 +95,27 @@ type ImportContext struct {
 	Import   func(string) (*Archive, error)
 }
 
-func NewImportContext(importFunc func(string) (*Archive, error)) *ImportContext {
-	return &ImportContext{
-		Packages: map[string]*types.Package{"unsafe": types.Unsafe},
-		Import:   importFunc,
+// packageImporter implements go/types.Importer interface.
+type packageImporter struct {
+	importContext *ImportContext
+	importError   *error // A pointer to importError in Compile.
+}
+
+func (pi packageImporter) Import(path string) (*types.Package, error) {
+	if path == "unsafe" {
+		return types.Unsafe, nil
 	}
+
+	a, err := pi.importContext.Import(path)
+	if err != nil {
+		if *pi.importError == nil {
+			// If import failed, show first error of import only (https://github.com/gopherjs/gopherjs/issues/119).
+			*pi.importError = err
+		}
+		return nil, err
+	}
+
+	return pi.importContext.Packages[a.ImportPath], nil
 }
 
 func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, importContext *ImportContext, minify bool) (*Archive, error) {
@@ -80,15 +132,9 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 	var errList ErrorList
 	var previousErr error
 	config := &types.Config{
-		Packages: importContext.Packages,
-		Import: func(_ map[string]*types.Package, path string) (*types.Package, error) {
-			if _, err := importContext.Import(path); err != nil {
-				if importError == nil {
-					importError = err
-				}
-				return nil, err
-			}
-			return importContext.Packages[path], nil
+		Importer: packageImporter{
+			importContext: importContext,
+			importError:   &importError,
 		},
 		Sizes: sizes32,
 		Error: func(err error) {
@@ -118,11 +164,15 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 	}
 	importContext.Packages[importPath] = typesPkg
 
-	gcData := bytes.NewBuffer(nil)
-	gcexporter.Write(typesPkg, gcData, sizes32)
+	exportData := importer.ExportData(typesPkg)
 	encodedFileSet := bytes.NewBuffer(nil)
 	if err := fileSet.Write(json.NewEncoder(encodedFileSet).Encode); err != nil {
 		return nil, err
+	}
+
+	simplifiedFiles := make([]*ast.File, len(files))
+	for i, file := range files {
+		simplifiedFiles[i] = astrewrite.Simplify(file, typesInfo, false)
 	}
 
 	isBlocking := func(f *types.Func) bool {
@@ -138,11 +188,13 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 		}
 		panic(fullName)
 	}
-	pkgInfo := analysis.AnalyzePkg(files, fileSet, typesInfo, typesPkg, isBlocking)
+	pkgInfo := analysis.AnalyzePkg(simplifiedFiles, fileSet, typesInfo, typesPkg, isBlocking)
 	c := &funcContext{
 		FuncInfo: pkgInfo.InitFuncInfo,
 		p: &pkgContext{
-			Info:         pkgInfo,
+			Info:                 pkgInfo,
+			additionalSelections: make(map[*ast.SelectorExpr]selection),
+
 			pkgVars:      make(map[string]string),
 			objectNames:  make(map[types.Object]string),
 			varPtrNames:  make(map[*types.Var]string),
@@ -170,7 +222,7 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 	}
 	sort.Strings(importedPaths)
 	for _, impPath := range importedPaths {
-		id := c.newIdent(fmt.Sprintf(`%s.$init`, c.p.pkgVars[impPath]), types.NewSignature(nil, nil, nil, nil, false))
+		id := c.newIdent(fmt.Sprintf(`%s.$init`, c.p.pkgVars[impPath]), types.NewSignature(nil, nil, nil, false))
 		call := &ast.CallExpr{Fun: id}
 		c.Blocking[call] = true
 		c.Flattened[call] = true
@@ -183,7 +235,7 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 
 	var functions []*ast.FuncDecl
 	var vars []*types.Var
-	for _, file := range files {
+	for _, file := range simplifiedFiles {
 		for _, decl := range file.Decls {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
@@ -255,12 +307,12 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 		if !o.Exported() {
 			d.Vars = []string{c.objectName(o)}
 		}
-		if c.p.HasPointer[o] {
+		if c.p.HasPointer[o] && !o.Exported() {
 			d.Vars = append(d.Vars, c.varPtrName(o))
 		}
 		if _, ok := varsWithInit[o]; !ok {
 			d.DceDeps = collectDependencies(func() {
-				d.InitCode = []byte(fmt.Sprintf("\t\t%s = %s;\n", c.objectName(o), c.zeroValue(o.Type())))
+				d.InitCode = []byte(fmt.Sprintf("\t\t%s = %s;\n", c.objectName(o), c.translateExpr(c.zeroValue(o.Type())).String()))
 			})
 		}
 		d.DceObjectFilter = o.Name()
@@ -313,7 +365,7 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 				d.DceObjectFilter = ""
 			case "init":
 				d.InitCode = c.CatchOutput(1, func() {
-					id := c.newIdent("", types.NewSignature(nil, nil, nil, nil, false))
+					id := c.newIdent("", types.NewSignature(nil, nil, nil, false))
 					c.p.Uses[id] = o
 					call := &ast.CallExpr{Fun: id}
 					if len(c.p.FuncDeclInfos[o].Blocking) != 0 {
@@ -346,14 +398,30 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 		if mainFunc == nil {
 			return nil, fmt.Errorf("missing main function")
 		}
-		id := c.newIdent("", types.NewSignature(nil, nil, nil, nil, false))
+		id := c.newIdent("", types.NewSignature(nil, nil, nil, false))
 		c.p.Uses[id] = mainFunc
 		call := &ast.CallExpr{Fun: id}
+		ifStmt := &ast.IfStmt{
+			Cond: c.newIdent("$pkg === $mainPkg", types.Typ[types.Bool]),
+			Body: &ast.BlockStmt{
+				List: []ast.Stmt{
+					&ast.ExprStmt{X: call},
+					&ast.AssignStmt{
+						Lhs: []ast.Expr{c.newIdent("$mainFinished", types.Typ[types.Bool])},
+						Tok: token.ASSIGN,
+						Rhs: []ast.Expr{c.newConst(types.Typ[types.Bool], constant.MakeBool(true))},
+					},
+				},
+			},
+		}
 		if len(c.p.FuncDeclInfos[mainFunc].Blocking) != 0 {
 			c.Blocking[call] = true
+			c.Flattened[ifStmt] = true
 		}
 		funcDecls = append(funcDecls, &Decl{
-			InitCode: c.CatchOutput(1, func() { c.translateStmt(&ast.ExprStmt{X: call}, nil) }),
+			InitCode: c.CatchOutput(1, func() {
+				c.translateStmt(ifStmt, nil)
+			}),
 		})
 	}
 
@@ -369,8 +437,8 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 			d.DeclCode = c.CatchOutput(0, func() {
 				typeName := c.objectName(o)
 				lhs := typeName
-				if o.Parent() == c.p.Pkg.Scope() {
-					lhs += " = $pkg." + o.Name()
+				if isPkgLevel(o) {
+					lhs += " = $pkg." + encodeIdent(o.Name())
 				}
 				size := int64(0)
 				constructor := "null"
@@ -382,7 +450,7 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 					}
 					constructor = fmt.Sprintf("function(%s) {\n\t\tthis.$val = this;\n\t\tif (arguments.length === 0) {\n", strings.Join(params, ", "))
 					for i := 0; i < t.NumFields(); i++ {
-						constructor += fmt.Sprintf("\t\t\tthis.%s = %s;\n", fieldName(t, i), c.zeroValue(t.Field(i).Type()))
+						constructor += fmt.Sprintf("\t\t\tthis.%s = %s;\n", fieldName(t, i), c.translateExpr(c.zeroValue(t.Field(i).Type())).String())
 					}
 					constructor += "\t\t\treturn;\n\t\t}\n"
 					for i := 0; i < t.NumFields(); i++ {
@@ -464,11 +532,10 @@ func Compile(importPath string, files []*ast.File, fileSet *token.FileSet, impor
 		ImportPath:   importPath,
 		Name:         typesPkg.Name(),
 		Imports:      importedPaths,
-		GcData:       gcData.Bytes(),
+		ExportData:   exportData,
 		Declarations: allDecls,
 		FileSet:      encodedFileSet.Bytes(),
 		Minified:     minify,
-		types:        typesPkg,
 	}, nil
 }
 
@@ -536,24 +603,10 @@ func (c *funcContext) translateToplevelFunction(fun *ast.FuncDecl, info *analysi
 	var joinedParams string
 	primaryFunction := func(funcRef string) []byte {
 		if fun.Body == nil {
-			return []byte(fmt.Sprintf("\t%s = function() {\n\t\t$panic(\"Native function not implemented: %s\");\n\t};\n", funcRef, o.FullName()))
+			return []byte(fmt.Sprintf("\t%s = function() {\n\t\t$throwRuntimeError(\"native function not implemented: %s\");\n\t};\n", funcRef, o.FullName()))
 		}
 
 		var initStmts []ast.Stmt
-		for _, p := range fun.Type.Params.List {
-			for _, n := range p.Names {
-				switch c.p.Defs[n].Type().Underlying().(type) {
-				case *types.Array, *types.Struct:
-					initStmts = append([]ast.Stmt{
-						&ast.AssignStmt{
-							Lhs: []ast.Expr{n},
-							Tok: token.DEFINE,
-							Rhs: []ast.Expr{n},
-						},
-					}, initStmts...)
-				}
-			}
-		}
 		if recv != nil && !isBlank(recv) {
 			initStmts = append([]ast.Stmt{
 				&ast.AssignStmt{
@@ -574,7 +627,7 @@ func (c *funcContext) translateToplevelFunction(fun *ast.FuncDecl, info *analysi
 		funcRef := c.objectName(o)
 		code.Write(primaryFunction(funcRef))
 		if fun.Name.IsExported() {
-			fmt.Fprintf(code, "\t$pkg.%s = %s;\n", fun.Name.Name, funcRef)
+			fmt.Fprintf(code, "\t$pkg.%s = %s;\n", encodeIdent(fun.Name.Name), funcRef)
 		}
 		return code.Bytes()
 	}
@@ -616,6 +669,10 @@ func (c *funcContext) translateToplevelFunction(fun *ast.FuncDecl, info *analysi
 }
 
 func translateFunction(typ *ast.FuncType, initStmts []ast.Stmt, body *ast.BlockStmt, outerContext *funcContext, sig *types.Signature, info *analysis.FuncInfo, funcRef string) ([]string, string) {
+	if info == nil {
+		panic("nil info")
+	}
+
 	c := &funcContext{
 		FuncInfo:    info,
 		p:           outerContext.p,
@@ -644,6 +701,17 @@ func translateFunction(typ *ast.FuncType, initStmts []ast.Stmt, body *ast.BlockS
 				continue
 			}
 			params = append(params, c.objectName(c.p.Defs[ident]))
+
+			switch c.p.Defs[ident].Type().Underlying().(type) {
+			case *types.Array, *types.Struct:
+				initStmts = append([]ast.Stmt{
+					&ast.AssignStmt{
+						Lhs: []ast.Expr{ident},
+						Tok: token.DEFINE,
+						Rhs: []ast.Expr{ident},
+					},
+				}, initStmts...)
+			}
 		}
 	}
 
@@ -657,7 +725,7 @@ func translateFunction(typ *ast.FuncType, initStmts []ast.Stmt, body *ast.BlockS
 			c.resultNames = make([]ast.Expr, c.sig.Results().Len())
 			for i := 0; i < c.sig.Results().Len(); i++ {
 				result := c.sig.Results().At(i)
-				c.Printf("%s = %s;", c.objectName(result), c.zeroValue(result.Type()))
+				c.Printf("%s = %s;", c.objectName(result), c.translateExpr(c.zeroValue(result.Type())).String())
 				id := ast.NewIdent("")
 				c.p.Uses[id] = result
 				c.resultNames[i] = c.setType(id, result.Type())
@@ -721,7 +789,10 @@ func translateFunction(typ *ast.FuncType, initStmts []ast.Stmt, body *ast.BlockS
 
 	if len(c.Flattened) != 0 {
 		prefix = prefix + " s: while (true) { switch ($s) { case 0:"
-		suffix = " $s = -1; case -1: } return; }" + suffix
+		suffix = " } return; }" + suffix
+		if !endsWithReturn(body.List) {
+			suffix = " $s = -1; case -1:" + suffix
+		}
 	}
 
 	if c.HasDefer {

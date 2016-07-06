@@ -46,6 +46,8 @@ var $callDeferred = function(deferred, jsErr, fromPanic) {
       if (deferred === null) {
         deferred = $curGoroutine.deferStack[$curGoroutine.deferStack.length - 1];
         if (deferred === undefined) {
+          /* The panic reached the top of the stack. Clear it and throw it as a JavaScript error. */
+          $panicStackDepth = null;
           if (localPanicValue.Object instanceof Error) {
             throw localPanicValue.Object;
           }
@@ -111,34 +113,37 @@ var $throw = function(err) { throw err; };
 
 var $dummyGoroutine = { asleep: false, exit: false, deferStack: [], panicStack: [], canBlock: false };
 var $curGoroutine = $dummyGoroutine, $totalGoroutines = 0, $awakeGoroutines = 0, $checkForDeadlock = true;
+var $mainFinished = false;
 var $go = function(fun, args, direct) {
   $totalGoroutines++;
   $awakeGoroutines++;
   var $goroutine = function() {
-    var rescheduled = false;
     try {
       $curGoroutine = $goroutine;
       var r = fun.apply(undefined, args);
       if (r && r.$blk !== undefined) {
         fun = function() { return r.$blk(); };
         args = [];
-        rescheduled = true;
         return;
       }
       $goroutine.exit = true;
     } catch (err) {
-      $goroutine.exit = true;
-      throw err;
+      if (!$goroutine.exit) {
+        throw err;
+      }
     } finally {
       $curGoroutine = $dummyGoroutine;
-      if ($goroutine.exit && !rescheduled) { /* also set by runtime.Goexit() */
+      if ($goroutine.exit) { /* also set by runtime.Goexit() */
         $totalGoroutines--;
         $goroutine.asleep = true;
       }
-      if ($goroutine.asleep && !rescheduled) {
+      if ($goroutine.asleep) {
         $awakeGoroutines--;
-        if ($awakeGoroutines === 0 && $totalGoroutines !== 0 && $checkForDeadlock) {
+        if (!$mainFinished && $awakeGoroutines === 0 && $checkForDeadlock) {
           console.error("fatal error: all goroutines are asleep - deadlock!");
+          if ($global.process !== undefined) {
+            $global.process.exit(2);
+          }
         }
       }
     }
@@ -151,7 +156,20 @@ var $go = function(fun, args, direct) {
   $schedule($goroutine, direct);
 };
 
-var $scheduled = [], $schedulerLoopActive = false;
+var $scheduled = [], $schedulerActive = false;
+var $runScheduled = function() {
+  try {
+    var r;
+    while ((r = $scheduled.shift()) !== undefined) {
+      r();
+    }
+    $schedulerActive = false;
+  } finally {
+    if ($schedulerActive) {
+      setTimeout($runScheduled, 0);
+    }
+  }
+};
 var $schedule = function(goroutine, direct) {
   if (goroutine.asleep) {
     goroutine.asleep = false;
@@ -164,19 +182,18 @@ var $schedule = function(goroutine, direct) {
   }
 
   $scheduled.push(goroutine);
-  if (!$schedulerLoopActive) {
-    $schedulerLoopActive = true;
-    setTimeout(function() {
-      while (true) {
-        var r = $scheduled.shift();
-        if (r === undefined) {
-          $schedulerLoopActive = false;
-          break;
-        }
-        r();
-      };
-    }, 0);
+  if (!$schedulerActive) {
+    $schedulerActive = true;
+    setTimeout($runScheduled, 0);
   }
+};
+
+var $setTimeout = function(f, t) {
+  $awakeGoroutines++;
+  return setTimeout(function() {
+    $awakeGoroutines--;
+    f();
+  }, t);
 };
 
 var $block = function() {
@@ -201,30 +218,32 @@ var $send = function(chan, value) {
   }
 
   var thisGoroutine = $curGoroutine;
-  chan.$sendQueue.push(function() {
+  var closedDuringSend;
+  chan.$sendQueue.push(function(closed) {
+    closedDuringSend = closed;
     $schedule(thisGoroutine);
     return value;
   });
   $block();
   return {
     $blk: function() {
-      if (chan.$closed) {
+      if (closedDuringSend) {
         $throwRuntimeError("send on closed channel");
       }
-    },
+    }
   };
 };
 var $recv = function(chan) {
   var queuedSend = chan.$sendQueue.shift();
   if (queuedSend !== undefined) {
-    chan.$buffer.push(queuedSend());
+    chan.$buffer.push(queuedSend(false));
   }
   var bufferedValue = chan.$buffer.shift();
   if (bufferedValue !== undefined) {
     return [bufferedValue, true];
   }
   if (chan.$closed) {
-    return [chan.constructor.elem.zero(), false];
+    return [chan.$elem.zero(), false];
   }
 
   var thisGoroutine = $curGoroutine;
@@ -247,14 +266,14 @@ var $close = function(chan) {
     if (queuedSend === undefined) {
       break;
     }
-    queuedSend(); /* will panic because of closed channel */
+    queuedSend(true); /* will panic */
   }
   while (true) {
     var queuedRecv = chan.$recvQueue.shift();
     if (queuedRecv === undefined) {
       break;
     }
-    queuedRecv([chan.constructor.elem.zero(), false]);
+    queuedRecv([chan.$elem.zero(), false]);
   }
 };
 var $select = function(comms) {

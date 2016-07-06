@@ -5,6 +5,7 @@ package js_test
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,6 +288,17 @@ func TestDate(t *testing.T) {
 	}
 }
 
+// https://github.com/gopherjs/gopherjs/issues/287
+func TestInternalizeDate(t *testing.T) {
+	var a = time.Unix(0, (123 * time.Millisecond).Nanoseconds())
+	var b time.Time
+	js.Global.Set("internalizeDate", func(t time.Time) { b = t })
+	js.Global.Call("eval", "(internalizeDate(new Date(123)))")
+	if a != b {
+		t.Fail()
+	}
+}
+
 func TestEquality(t *testing.T) {
 	if js.Global.Get("Array") != js.Global.Get("Array") || js.Global.Get("Array") == js.Global.Get("String") {
 		t.Fail()
@@ -298,6 +310,31 @@ func TestEquality(t *testing.T) {
 	b := S{o1}
 	c := S{o2}
 	if a != b || a == c {
+		t.Fail()
+	}
+}
+
+func TestUndefinedEquality(t *testing.T) {
+	var ui interface{} = js.Undefined
+	if ui != js.Undefined {
+		t.Fail()
+	}
+}
+
+func TestInterfaceEquality(t *testing.T) {
+	o := js.Global.Get("Object").New()
+	var i interface{} = o
+	if i != o {
+		t.Fail()
+	}
+}
+
+func TestUndefinedInternalization(t *testing.T) {
+	undefinedEqualsJsUndefined := func(i interface{}) bool {
+		return i == js.Undefined
+	}
+	js.Global.Set("undefinedEqualsJsUndefined", undefinedEqualsJsUndefined)
+	if !js.Global.Call("eval", "(undefinedEqualsJsUndefined(undefined))").Bool() {
 		t.Fail()
 	}
 }
@@ -340,7 +377,7 @@ func TestError(t *testing.T) {
 			t.Fail()
 		}
 		jsErr, ok := err.(*js.Error)
-		if !ok || jsErr.Get("stack") == js.Undefined {
+		if !ok || !strings.Contains(jsErr.Error(), "throwsError") {
 			t.Fail()
 		}
 	}()
@@ -362,15 +399,21 @@ func TestExternalizeField(t *testing.T) {
 
 func TestMakeFunc(t *testing.T) {
 	o := js.Global.Get("Object").New()
-	o.Set("f", js.MakeFunc(func(this *js.Object, arguments []*js.Object) interface{} {
-		if this != o {
-			t.Fail()
+	for i := 3; i < 5; i++ {
+		x := i
+		if i == 4 {
+			break
 		}
-		if len(arguments) != 2 || arguments[0].Int() != 1 || arguments[1].Int() != 2 {
-			t.Fail()
-		}
-		return 3
-	}))
+		o.Set("f", js.MakeFunc(func(this *js.Object, arguments []*js.Object) interface{} {
+			if this != o {
+				t.Fail()
+			}
+			if len(arguments) != 2 || arguments[0].Int() != 1 || arguments[1].Int() != 2 {
+				t.Fail()
+			}
+			return x
+		}))
+	}
 	if o.Call("f", 1, 2).Int() != 3 {
 		t.Fail()
 	}
@@ -390,9 +433,21 @@ func (m *M) Method(a interface{}) map[string]string {
 }
 
 func TestMakeWrapper(t *testing.T) {
-	if !js.Global.Call("eval", `(function(m) { return m.Method({x: 1})["y"] === "z"; })`).Invoke(js.MakeWrapper(&M{42})).Bool() {
+	m := &M{42}
+	if !js.Global.Call("eval", `(function(m) { return m.Method({x: 1})["y"] === "z"; })`).Invoke(js.MakeWrapper(m)).Bool() {
 		t.Fail()
 	}
+
+	if js.MakeWrapper(m).Interface() != m {
+		t.Fail()
+	}
+
+	f := func(m *M) {
+		if m.f != 42 {
+			t.Fail()
+		}
+	}
+	js.Global.Call("eval", `(function(f, m) { f(m); })`).Invoke(f, js.MakeWrapper(m))
 }
 
 func TestCallWithNull(t *testing.T) {
@@ -455,6 +510,21 @@ func TestNewArrayBuffer(t *testing.T) {
 	}
 }
 
+func TestInternalizeExternalizeNull(t *testing.T) {
+	type S struct {
+		*js.Object
+	}
+	r := js.Global.Call("eval", "(function(f) { return f(null); })").Invoke(func(s S) S {
+		if s.Object != nil {
+			t.Fail()
+		}
+		return s
+	})
+	if r != nil {
+		t.Fail()
+	}
+}
+
 func TestInternalizeExternalizeUndefined(t *testing.T) {
 	type S struct {
 		*js.Object
@@ -474,6 +544,17 @@ func TestDereference(t *testing.T) {
 	s := *dummys
 	p := &s
 	if p != dummys {
+		t.Fail()
+	}
+}
+
+func TestSurrogatePairs(t *testing.T) {
+	js.Global.Set("str", "\U0001F600")
+	str := js.Global.Get("str")
+	if str.Get("length").Int() != 2 || str.Call("charCodeAt", 0).Int() != 55357 || str.Call("charCodeAt", 1).Int() != 56832 {
+		t.Fail()
+	}
+	if str.String() != "\U0001F600" {
 		t.Fail()
 	}
 }

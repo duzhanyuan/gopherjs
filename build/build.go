@@ -7,24 +7,30 @@ import (
 	"go/parser"
 	"go/scanner"
 	"go/token"
+	"go/types"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gopherjs/gopherjs/compiler"
+	"github.com/gopherjs/gopherjs/compiler/natives"
 	"github.com/kardianos/osext"
 	"github.com/neelance/sourcemap"
-	"gopkg.in/fsnotify.v1"
 )
 
-type ImportCError struct{}
+type ImportCError struct {
+	pkgPath string
+}
 
 func (e *ImportCError) Error() string {
-	return `importing "C" is not supported by GopherJS`
+	return e.pkgPath + `: importing "C" is not supported by GopherJS`
 }
 
 func NewBuildContext(installSuffix string, buildTags []string) *build.Context {
@@ -37,14 +43,29 @@ func NewBuildContext(installSuffix string, buildTags []string) *build.Context {
 		Compiler:      "gc",
 		BuildTags:     append(buildTags, "netgo"),
 		ReleaseTags:   build.Default.ReleaseTags,
+		CgoEnabled:    true, // detect `import "C"` to throw proper error
 	}
 }
 
-func Import(path string, mode build.ImportMode, installSuffix string, buildTags []string) (*build.Package, error) {
-	if path == "C" {
-		return nil, &ImportCError{}
-	}
+// Import returns details about the Go package named by the import path. If the
+// path is a local import path naming a package that can be imported using
+// a standard import path, the returned package will set p.ImportPath to
+// that path.
+//
+// In the directory containing the package, .go and .inc.js files are
+// considered part of the package except for:
+//
+//    - .go files in package documentation
+//    - files starting with _ or . (likely editor temporary files)
+//    - files with build constraints not satisfied by the context
+//
+// If an error occurs, Import returns a non-nil error and a nil
+// *PackageData.
+func Import(path string, mode build.ImportMode, installSuffix string, buildTags []string) (*PackageData, error) {
+	return importWithSrcDir(path, "", mode, installSuffix, buildTags)
+}
 
+func importWithSrcDir(path string, srcDir string, mode build.ImportMode, installSuffix string, buildTags []string) (*PackageData, error) {
 	buildContext := NewBuildContext(installSuffix, buildTags)
 	if path == "runtime" || path == "syscall" {
 		buildContext.GOARCH = build.Default.GOARCH
@@ -53,21 +74,34 @@ func Import(path string, mode build.ImportMode, installSuffix string, buildTags 
 			buildContext.InstallSuffix += "_" + installSuffix
 		}
 	}
-	pkg, err := buildContext.Import(path, "", mode)
+	pkg, err := buildContext.Import(path, srcDir, mode)
 	if err != nil {
 		return nil, err
 	}
+
 	switch path {
 	case "runtime":
-		pkg.GoFiles = []string{"error.go", fmt.Sprintf("zgoos_%s.go", buildContext.GOOS), "zversion.go"}
+		pkg.GoFiles = []string{"error.go"}
+	case "runtime/internal/sys":
+		pkg.GoFiles = []string{fmt.Sprintf("zgoos_%s.go", buildContext.GOOS), "zversion.go"}
 	case "runtime/pprof":
 		pkg.GoFiles = nil
+	case "crypto/rand":
+		pkg.GoFiles = []string{"rand.go", "util.go"}
+	case "crypto/x509":
+		pkg.CgoFiles = nil
 	case "hash/crc32":
 		pkg.GoFiles = []string{"crc32.go", "crc32_generic.go"}
 	}
+
+	if len(pkg.CgoFiles) > 0 {
+		return nil, &ImportCError{path}
+	}
+
 	if pkg.IsCommand() {
 		pkg.PkgObj = filepath.Join(pkg.BinDir, filepath.Base(pkg.ImportPath)+".js")
 	}
+
 	if _, err := os.Stat(pkg.PkgObj); os.IsNotExist(err) && strings.HasPrefix(pkg.PkgObj, build.Default.GOROOT) {
 		// fall back to GOPATH
 		firstGopathWorkspace := filepath.SplitList(build.Default.GOPATH)[0] // TODO: Need to check inside all GOPATH workspaces.
@@ -76,14 +110,47 @@ func Import(path string, mode build.ImportMode, installSuffix string, buildTags 
 			pkg.PkgObj = gopathPkgObj
 		}
 	}
-	return pkg, nil
+
+	jsFiles, err := jsFilesFromDir(pkg.Dir)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PackageData{Package: pkg, JSFiles: jsFiles}, nil
 }
 
-func Parse(pkg *build.Package, fileSet *token.FileSet) ([]*ast.File, error) {
+// ImportDir is like Import but processes the Go package found in the named
+// directory.
+func ImportDir(dir string, mode build.ImportMode) (*PackageData, error) {
+	pkg, err := build.ImportDir(dir, mode)
+	if err != nil {
+		return nil, err
+	}
+
+	jsFiles, err := jsFilesFromDir(pkg.Dir)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PackageData{Package: pkg, JSFiles: jsFiles}, nil
+}
+
+// parseAndAugment parses and returns all .go files of given pkg.
+// Standard Go library packages are augmented with files in compiler/natives folder.
+// If isTest is true and pkg.ImportPath has no _test suffix, package is built for running internal tests.
+// If isTest is true and pkg.ImportPath has _test suffix, package is built for running external tests.
+//
+// The native packages are augmented by the contents of natives.FS in the following way.
+// The file names do not matter except the usual `_test` suffix. The files for
+// native overrides get added to the package (even if they have the same name
+// as an existing file from the standard library). For all identifiers that exist
+// in the original AND the overrides, the original identifier in the AST gets
+// replaced by `_`. New identifiers that don't exist in original package get added.
+func parseAndAugment(pkg *build.Package, isTest bool, fileSet *token.FileSet) ([]*ast.File, error) {
 	var files []*ast.File
 	replacedDeclNames := make(map[string]bool)
 	funcName := func(d *ast.FuncDecl) string {
-		if d.Recv == nil {
+		if d.Recv == nil || len(d.Recv.List) == 0 {
 			return d.Name.Name
 		}
 		recv := d.Recv.List[0].Type
@@ -92,21 +159,71 @@ func Parse(pkg *build.Package, fileSet *token.FileSet) ([]*ast.File, error) {
 		}
 		return recv.(*ast.Ident).Name + "." + d.Name.Name
 	}
-	isTestPkg := strings.HasSuffix(pkg.ImportPath, "_test")
+	isXTest := strings.HasSuffix(pkg.ImportPath, "_test")
 	importPath := pkg.ImportPath
-	if isTestPkg {
+	if isXTest {
 		importPath = importPath[:len(importPath)-5]
 	}
-	if nativesPkg, err := Import("github.com/gopherjs/gopherjs/compiler/natives/"+importPath, 0, "", nil); err == nil {
-		names := append(nativesPkg.GoFiles, nativesPkg.TestGoFiles...)
-		if isTestPkg {
+
+	nativesContext := &build.Context{
+		GOROOT:   "/",
+		GOOS:     build.Default.GOOS,
+		GOARCH:   "js",
+		Compiler: "gc",
+		JoinPath: path.Join,
+		SplitPathList: func(list string) []string {
+			if list == "" {
+				return nil
+			}
+			return strings.Split(list, "/")
+		},
+		IsAbsPath: path.IsAbs,
+		IsDir: func(name string) bool {
+			dir, err := natives.FS.Open(name)
+			if err != nil {
+				return false
+			}
+			defer dir.Close()
+			info, err := dir.Stat()
+			if err != nil {
+				return false
+			}
+			return info.IsDir()
+		},
+		HasSubdir: func(root, name string) (rel string, ok bool) {
+			panic("not implemented")
+		},
+		ReadDir: func(name string) (fi []os.FileInfo, err error) {
+			dir, err := natives.FS.Open(name)
+			if err != nil {
+				return nil, err
+			}
+			defer dir.Close()
+			return dir.Readdir(0)
+		},
+		OpenFile: func(name string) (r io.ReadCloser, err error) {
+			return natives.FS.Open(name)
+		},
+	}
+	if nativesPkg, err := nativesContext.Import(importPath, "", 0); err == nil {
+		names := nativesPkg.GoFiles
+		if isTest {
+			names = append(names, nativesPkg.TestGoFiles...)
+		}
+		if isXTest {
 			names = nativesPkg.XTestGoFiles
 		}
 		for _, name := range names {
-			file, err := parser.ParseFile(fileSet, filepath.Join(nativesPkg.Dir, name), nil, parser.ParseComments)
+			fullPath := path.Join(nativesPkg.Dir, name)
+			r, err := nativesContext.OpenFile(fullPath)
 			if err != nil {
 				panic(err)
 			}
+			file, err := parser.ParseFile(fileSet, fullPath, r, parser.ParseComments)
+			if err != nil {
+				panic(err)
+			}
+			r.Close()
 			for _, decl := range file.Decls {
 				switch d := decl.(type) {
 				case *ast.FuncDecl:
@@ -208,6 +325,7 @@ type Options struct {
 	GOROOT        string
 	GOPATH        string
 	Verbose       bool
+	Quiet         bool
 	Watch         bool
 	CreateMapFile bool
 	Minify        bool
@@ -231,17 +349,17 @@ func (o *Options) PrintSuccess(format string, a ...interface{}) {
 
 type PackageData struct {
 	*build.Package
-	JsFiles    []string
+	JSFiles    []string
+	IsTest     bool // IsTest is true if the package is being built for running tests.
 	SrcModTime time.Time
 	UpToDate   bool
-	Archive    *compiler.Archive
 }
 
 type Session struct {
-	options       *Options
-	Packages      map[string]*PackageData
-	ImportContext *compiler.ImportContext
-	Watcher       *fsnotify.Watcher
+	options  *Options
+	Archives map[string]*compiler.Archive
+	Types    map[string]*types.Package
+	Watcher  *fsnotify.Watcher
 }
 
 func NewSession(options *Options) *Session {
@@ -255,9 +373,9 @@ func NewSession(options *Options) *Session {
 
 	s := &Session{
 		options:  options,
-		Packages: make(map[string]*PackageData),
+		Archives: make(map[string]*compiler.Archive),
 	}
-	s.ImportContext = compiler.NewImportContext(s.ImportPackage)
+	s.Types = make(map[string]*types.Package)
 	if options.Watch {
 		if out, err := exec.Command("ulimit", "-n").Output(); err == nil {
 			if n, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil && n < 1024 {
@@ -290,15 +408,22 @@ func (s *Session) BuildDir(packagePath string, importPath string, pkgObj string)
 		return err
 	}
 	pkg := &PackageData{Package: buildPkg}
-	pkg.ImportPath = "main"
-	if err := s.BuildPackage(pkg); err != nil {
+	jsFiles, err := jsFilesFromDir(pkg.Dir)
+	if err != nil {
+		return err
+	}
+	pkg.JSFiles = jsFiles
+	archive, err := s.BuildPackage(pkg)
+	if err != nil {
 		return err
 	}
 	if pkgObj == "" {
 		pkgObj = filepath.Base(packagePath) + ".js"
 	}
-	if err := s.WriteCommandPackage(pkg, pkgObj); err != nil {
-		return err
+	if pkg.IsCommand() && !pkg.UpToDate {
+		if err := s.WriteCommandPackage(archive, pkgObj); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -314,55 +439,47 @@ func (s *Session) BuildFiles(filenames []string, pkgObj string, packagePath stri
 
 	for _, file := range filenames {
 		if strings.HasSuffix(file, ".inc.js") {
-			pkg.JsFiles = append(pkg.JsFiles, file)
+			pkg.JSFiles = append(pkg.JSFiles, file)
 			continue
 		}
 		pkg.GoFiles = append(pkg.GoFiles, file)
 	}
 
-	if err := s.BuildPackage(pkg); err != nil {
+	archive, err := s.BuildPackage(pkg)
+	if err != nil {
 		return err
 	}
-	if s.ImportContext.Packages["main"].Name() != "main" {
+	if s.Types["main"].Name() != "main" {
 		return fmt.Errorf("cannot build/run non-main package")
 	}
-	return s.WriteCommandPackage(pkg, pkgObj)
+	return s.WriteCommandPackage(archive, pkgObj)
 }
 
-func (s *Session) ImportPackage(path string) (*compiler.Archive, error) {
-	if pkg, found := s.Packages[path]; found {
-		return pkg.Archive, nil
-	}
-
-	buildPkg, err := Import(path, 0, s.InstallSuffix(), s.options.BuildTags)
-	if s.Watcher != nil && buildPkg != nil { // add watch even on error
-		s.Watcher.Add(buildPkg.Dir)
-	}
-	if err != nil {
-		return nil, err
-	}
-	pkg := &PackageData{Package: buildPkg}
-
-	files, err := ioutil.ReadDir(pkg.Dir)
-	if err != nil {
-		return nil, err
-	}
-	for _, file := range files {
-		if strings.HasSuffix(file.Name(), ".inc.js") && file.Name()[0] != '_' {
-			pkg.JsFiles = append(pkg.JsFiles, file.Name())
-		}
-	}
-
-	if err := s.BuildPackage(pkg); err != nil {
-		return nil, err
-	}
-	return pkg.Archive, nil
+func (s *Session) BuildImportPath(path string) (*compiler.Archive, error) {
+	_, archive, err := s.buildImportPathWithSrcDir(path, "")
+	return archive, err
 }
 
-func (s *Session) BuildPackage(pkg *PackageData) error {
-	s.Packages[pkg.ImportPath] = pkg
-	if pkg.ImportPath == "unsafe" {
-		return nil
+func (s *Session) buildImportPathWithSrcDir(path string, srcDir string) (*PackageData, *compiler.Archive, error) {
+	pkg, err := importWithSrcDir(path, srcDir, 0, s.InstallSuffix(), s.options.BuildTags)
+	if s.Watcher != nil && pkg != nil { // add watch even on error
+		s.Watcher.Add(pkg.Dir)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	archive, err := s.BuildPackage(pkg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return pkg, archive, nil
+}
+
+func (s *Session) BuildPackage(pkg *PackageData) (*compiler.Archive, error) {
+	if archive, ok := s.Archives[pkg.ImportPath]; ok {
+		return archive, nil
 	}
 
 	if pkg.PkgObj != "" {
@@ -396,20 +513,20 @@ func (s *Session) BuildPackage(pkg *PackageData) error {
 			if importedPkgPath == "unsafe" || ignored {
 				continue
 			}
-			_, err := s.ImportPackage(importedPkgPath)
+			pkg, _, err := s.buildImportPathWithSrcDir(importedPkgPath, pkg.Dir)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			impModeTime := s.Packages[importedPkgPath].SrcModTime
+			impModeTime := pkg.SrcModTime
 			if impModeTime.After(pkg.SrcModTime) {
 				pkg.SrcModTime = impModeTime
 			}
 		}
 
-		for _, name := range append(pkg.GoFiles, pkg.JsFiles...) {
+		for _, name := range append(pkg.GoFiles, pkg.JSFiles...) {
 			fileInfo, err := os.Stat(filepath.Join(pkg.Dir, name))
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if fileInfo.ModTime().After(pkg.SrcModTime) {
 				pkg.SrcModTime = fileInfo.ModTime()
@@ -421,70 +538,87 @@ func (s *Session) BuildPackage(pkg *PackageData) error {
 			// package object is up to date, load from disk if library
 			pkg.UpToDate = true
 			if pkg.IsCommand() {
-				return nil
+				return nil, nil
 			}
 
 			objFile, err := os.Open(pkg.PkgObj)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			defer objFile.Close()
 
-			pkg.Archive, err = compiler.ReadArchive(pkg.PkgObj, pkg.ImportPath, objFile, s.ImportContext.Packages)
+			archive, err := compiler.ReadArchive(pkg.PkgObj, pkg.ImportPath, objFile, s.Types)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
-			return nil
+			s.Archives[pkg.ImportPath] = archive
+			return archive, err
 		}
 	}
 
 	fileSet := token.NewFileSet()
-	files, err := Parse(pkg.Package, fileSet)
+	files, err := parseAndAugment(pkg.Package, pkg.IsTest, fileSet)
 	if err != nil {
-		return err
-	}
-	pkg.Archive, err = compiler.Compile(pkg.ImportPath, files, fileSet, s.ImportContext, s.options.Minify)
-	if err != nil {
-		return err
+		return nil, err
 	}
 
-	var jsDecls []*compiler.Decl
-	for _, jsFile := range pkg.JsFiles {
+	localImportPathCache := make(map[string]*compiler.Archive)
+	importContext := &compiler.ImportContext{
+		Packages: s.Types,
+		Import: func(path string) (*compiler.Archive, error) {
+			if archive, ok := localImportPathCache[path]; ok {
+				return archive, nil
+			}
+			_, archive, err := s.buildImportPathWithSrcDir(path, pkg.Dir)
+			if err != nil {
+				return nil, err
+			}
+			localImportPathCache[path] = archive
+			return archive, nil
+		},
+	}
+	archive, err := compiler.Compile(pkg.ImportPath, files, fileSet, importContext, s.options.Minify)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, jsFile := range pkg.JSFiles {
 		code, err := ioutil.ReadFile(filepath.Join(pkg.Dir, jsFile))
 		if err != nil {
-			return err
+			return nil, err
 		}
-		jsDecls = append(jsDecls, &compiler.Decl{
-			DeclCode: append(append([]byte("\t(function() {\n"), code...), []byte("\n\t}).call($global);\n")...),
-		})
+		archive.IncJSCode = append(archive.IncJSCode, []byte("\t(function() {\n")...)
+		archive.IncJSCode = append(archive.IncJSCode, code...)
+		archive.IncJSCode = append(archive.IncJSCode, []byte("\n\t}).call($global);\n")...)
 	}
-	pkg.Archive.Declarations = append(jsDecls, pkg.Archive.Declarations...)
 
 	if s.options.Verbose {
 		fmt.Println(pkg.ImportPath)
 	}
 
+	s.Archives[pkg.ImportPath] = archive
+
 	if pkg.PkgObj == "" || pkg.IsCommand() {
-		return nil
+		return archive, nil
 	}
 
-	if err := s.writeLibraryPackage(pkg, pkg.PkgObj); err != nil {
+	if err := s.writeLibraryPackage(archive, pkg.PkgObj); err != nil {
 		if strings.HasPrefix(pkg.PkgObj, s.options.GOROOT) {
 			// fall back to first GOPATH workspace
 			firstGopathWorkspace := filepath.SplitList(s.options.GOPATH)[0]
-			if err := s.writeLibraryPackage(pkg, filepath.Join(firstGopathWorkspace, pkg.PkgObj[len(s.options.GOROOT):])); err != nil {
-				return err
+			if err := s.writeLibraryPackage(archive, filepath.Join(firstGopathWorkspace, pkg.PkgObj[len(s.options.GOROOT):])); err != nil {
+				return nil, err
 			}
-			return nil
+			return archive, nil
 		}
-		return err
+		return nil, err
 	}
 
-	return nil
+	return archive, nil
 }
 
-func (s *Session) writeLibraryPackage(pkg *PackageData, pkgObj string) error {
+func (s *Session) writeLibraryPackage(archive *compiler.Archive, pkgObj string) error {
 	if err := os.MkdirAll(filepath.Dir(pkgObj), 0777); err != nil {
 		return err
 	}
@@ -495,14 +629,10 @@ func (s *Session) writeLibraryPackage(pkg *PackageData, pkgObj string) error {
 	}
 	defer objFile.Close()
 
-	return compiler.WriteArchive(pkg.Archive, objFile)
+	return compiler.WriteArchive(archive, objFile)
 }
 
-func (s *Session) WriteCommandPackage(pkg *PackageData, pkgObj string) error {
-	if !pkg.IsCommand() || pkg.UpToDate {
-		return nil
-	}
-
+func (s *Session) WriteCommandPackage(archive *compiler.Archive, pkgObj string) error {
 	if err := os.MkdirAll(filepath.Dir(pkgObj), 0777); err != nil {
 		return err
 	}
@@ -529,7 +659,13 @@ func (s *Session) WriteCommandPackage(pkg *PackageData, pkgObj string) error {
 		sourceMapFilter.MappingCallback = NewMappingCallback(m, s.options.GOROOT, s.options.GOPATH)
 	}
 
-	deps, err := compiler.ImportDependencies(pkg.Archive, s.ImportContext.Import)
+	deps, err := compiler.ImportDependencies(archive, func(path string) (*compiler.Archive, error) {
+		if archive, ok := s.Archives[path]; ok {
+			return archive, nil
+		}
+		_, archive, err := s.buildImportPathWithSrcDir(path, "")
+		return archive, err
+	})
 	if err != nil {
 		return err
 	}
@@ -555,6 +691,20 @@ func NewMappingCallback(m *sourcemap.Map, goroot, gopath string) func(generatedL
 	}
 }
 
+func jsFilesFromDir(dir string) ([]string, error) {
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var jsFiles []string
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".inc.js") && file.Name()[0] != '_' && file.Name()[0] != '.' {
+			jsFiles = append(jsFiles, file.Name())
+		}
+	}
+	return jsFiles, nil
+}
+
 // hasGopathPrefix returns true and the length of the matched GOPATH workspace,
 // iff file has a prefix that matches one of the GOPATH workspaces.
 func hasGopathPrefix(file, gopath string) (hasGopathPrefix bool, prefixLen int) {
@@ -574,6 +724,9 @@ func (s *Session) WaitForChange() {
 		select {
 		case ev := <-s.Watcher.Events:
 			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 || filepath.Base(ev.Name)[0] == '.' {
+				continue
+			}
+			if !strings.HasSuffix(ev.Name, ".go") && !strings.HasSuffix(ev.Name, ".inc.js") {
 				continue
 			}
 			s.options.PrintSuccess("change detected: %s\n", ev.Name)
